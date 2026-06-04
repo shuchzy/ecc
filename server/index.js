@@ -1702,10 +1702,17 @@ async function supplierFetch(url, options = {}) {
   const cookie = cookieHeader(options.cookieJar);
   if (cookie) headers.Cookie = cookie;
   let response;
+  const useLegacyTls = /(^|\.)morlevi\.co\.il$/i.test(new URL(url).hostname);
   try {
-    response = await fetch(url, { ...options, headers, redirect: "manual" });
+    response = useLegacyTls
+      ? await supplierHttpRequest(url, { ...options, headers })
+      : await fetch(url, { ...options, headers, redirect: "manual" });
   } catch (error) {
-    response = await supplierHttpRequest(url, { ...options, headers });
+    try {
+      response = await supplierHttpRequest(url, { ...options, headers });
+    } catch (fallbackError) {
+      throw new Error(fallbackError.message || error.message || "fetch failed");
+    }
   }
   storeCookies(options.cookieJar, response.headers.getSetCookie?.() || response.headers.get("set-cookie"));
   if (response.status >= 300 && response.status < 400 && response.headers.get("location")) {
@@ -1729,7 +1736,10 @@ function supplierHttpRequest(url, options = {}) {
       path: `${target.pathname}${target.search}`,
       method: options.method || "GET",
       headers,
-      rejectUnauthorized: process.env.SUPPLIER_TLS_REJECT_UNAUTHORIZED === "1"
+      rejectUnauthorized: process.env.SUPPLIER_TLS_REJECT_UNAUTHORIZED === "1",
+      secureOptions: isHttps ? crypto.constants.SSL_OP_LEGACY_SERVER_CONNECT : undefined,
+      ciphers: isHttps ? "DEFAULT@SECLEVEL=0" : undefined,
+      minVersion: isHttps ? "TLSv1" : undefined
     }, (response) => {
       const chunks = [];
       response.on("data", (chunk) => chunks.push(chunk));
@@ -1745,7 +1755,7 @@ function supplierHttpRequest(url, options = {}) {
         });
       });
     });
-    request.on("error", reject);
+    request.on("error", (error) => reject(new Error(`Supplier request failed (${target.hostname}): ${error.message}`)));
     if (body) request.write(body);
     request.end();
   });
