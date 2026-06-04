@@ -2,6 +2,7 @@ import cors from "cors";
 import express from "express";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import https from "node:https";
 import net from "node:net";
 import path from "node:path";
@@ -30,6 +31,10 @@ const roomStreams = new Map();
 const appUsername = process.env.APP_USERNAME || "ECC";
 const appPassword = process.env.APP_PASSWORD || "180056700";
 const authSessions = new Map();
+
+if (process.env.SUPPLIER_TLS_REJECT_UNAUTHORIZED !== "1") {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+}
 
 fs.mkdirSync(dataDir, { recursive: true });
 fs.mkdirSync(certDir, { recursive: true });
@@ -1696,12 +1701,75 @@ async function supplierFetch(url, options = {}) {
   };
   const cookie = cookieHeader(options.cookieJar);
   if (cookie) headers.Cookie = cookie;
-  const response = await fetch(url, { ...options, headers, redirect: "manual" });
+  let response;
+  try {
+    response = await fetch(url, { ...options, headers, redirect: "manual" });
+  } catch (error) {
+    response = await supplierHttpRequest(url, { ...options, headers });
+  }
   storeCookies(options.cookieJar, response.headers.getSetCookie?.() || response.headers.get("set-cookie"));
   if (response.status >= 300 && response.status < 400 && response.headers.get("location")) {
     return supplierFetch(new URL(response.headers.get("location"), url).toString(), options);
   }
   return response;
+}
+
+function supplierHttpRequest(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const isHttps = target.protocol === "https:";
+    const transport = isHttps ? https : http;
+    const body = requestBodyBuffer(options.body);
+    const headers = { ...(options.headers || {}) };
+    if (body && !headers["Content-Length"]) headers["Content-Length"] = Buffer.byteLength(body);
+    const request = transport.request({
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || (isHttps ? 443 : 80),
+      path: `${target.pathname}${target.search}`,
+      method: options.method || "GET",
+      headers,
+      rejectUnauthorized: process.env.SUPPLIER_TLS_REJECT_UNAUTHORIZED === "1"
+    }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => {
+        const buffer = Buffer.concat(chunks);
+        resolve({
+          ok: response.statusCode >= 200 && response.statusCode < 300,
+          status: response.statusCode,
+          url,
+          headers: responseHeaders(response.headers),
+          text: async () => buffer.toString("utf8"),
+          json: async () => JSON.parse(buffer.toString("utf8") || "{}")
+        });
+      });
+    });
+    request.on("error", reject);
+    if (body) request.write(body);
+    request.end();
+  });
+}
+
+function requestBodyBuffer(body) {
+  if (!body) return null;
+  if (Buffer.isBuffer(body)) return body;
+  if (body instanceof URLSearchParams) return body.toString();
+  if (typeof body === "string") return body;
+  return String(body);
+}
+
+function responseHeaders(headers) {
+  return {
+    get(name) {
+      const value = headers[String(name || "").toLowerCase()];
+      return Array.isArray(value) ? value.join(", ") : value || null;
+    },
+    getSetCookie() {
+      const value = headers["set-cookie"];
+      return Array.isArray(value) ? value : value ? [value] : [];
+    }
+  };
 }
 
 function storeCookies(cookieJar, setCookies) {
